@@ -1,0 +1,28 @@
+services:
+  inspection:
+    build: .
+    image: road-inspection:latest
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      DATABASE_PATH: /data/inspection.db
+      # Required: generate with `openssl rand -hex 32` and export SECRET_KEY.
+      SECRET_KEY: "${SECRET_KEY:?SECRET_KEY must be set for session/CSRF signing}"
+      MAX_UPLOAD_BYTES: "33554432"
+      SPLIT_BATCH_SIZE: "500"
+    volumes:
+      - inspection-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  inspection-data:

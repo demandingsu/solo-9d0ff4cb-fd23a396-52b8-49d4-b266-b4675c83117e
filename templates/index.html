@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}公路巡检记录{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>选择路段与日期</h2>
+  <form method="get" action="{{ url_for('index') }}" class="grid-form">
+    <label>
+      公路名称
+      <input name="road" list="road-list" value="{{ selected_road }}" placeholder="例：G101" required>
+      <datalist id="road-list">
+        {% for road in roads %}<option value="{{ road }}">{% endfor %}
+      </datalist>
+    </label>
+    <label>
+      日期
+      <input type="date" name="date" value="{{ selected_date }}" required>
+    </label>
+    <button type="submit">查看当天</button>
+  </form>
+</section>
+
+{% if overview %}
+<section class="panel">
+  <h2>{{ overview.road }} · {{ overview.date }}</h2>
+  <p class="summary">
+    已收记录 <strong>{{ overview.record_count }}</strong> 条；
+    有效分区 <strong>{{ overview.partitions | selectattr('status', 'equalto', 'active') | list | length }}</strong> 个。
+  </p>
+
+  <h3>分区布局</h3>
+  <table>
+    <thead>
+      <tr><th>分区</th><th>里程范围（半开区间）</th><th>状态</th><th>记录数</th></tr>
+    </thead>
+    <tbody>
+      {% for part in overview.partitions %}
+      <tr class="status-{{ part.status }}">
+        <td>#{{ part.id }}</td>
+        <td><code>{{ part.lo | range_label(part.hi) }}</code></td>
+        <td>
+          {% if part.status == 'active' %}有效
+          {% elif part.status == 'retired' %}已退役
+          {% else %}影子（切换前不可见）{% endif %}
+          {% if part.split_state %}<span class="badge">复制中</span>{% endif %}
+        </td>
+        <td>{{ part.record_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>按里程拆分</h3>
+  <form method="post" action="{{ url_for('split') }}" class="grid-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="road" value="{{ overview.road }}">
+    <input type="hidden" name="date" value="{{ overview.date }}">
+    <label>
+      切点里程（整米）
+      <input type="number" name="cut" min="0" step="1" required placeholder="例：1000">
+    </label>
+    <button type="submit" class="danger">拆分</button>
+  </form>
+  <p class="hint">切点必须落在某个未拆分分区的内部；里程等于切点的记录归入右侧分区。</p>
+
+  {% if overview.split_jobs %}
+  <h3>最近拆分任务</h3>
+  <table>
+    <thead>
+      <tr><th>任务</th><th>原分区</th><th>切点</th><th>状态</th><th>已复制</th><th>时间</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      {% for job in overview.split_jobs %}
+      <tr>
+        <td>#{{ job.id }}</td>
+        <td>#{{ job.source_partition_id }}</td>
+        <td>{{ job.cut }}</td>
+        <td>
+          {% if job.status == 'switched' %}已切换
+          {% elif job.status == 'copying' %}复制中
+          {% else %}失败{% endif %}
+        </td>
+        <td>{{ job.copied_records }}</td>
+        <td>{{ job.finished_at or job.created_at }}</td>
+        <td class="hint">{{ job.error or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h3>上传当天记录（单个公路）</h3>
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="grid-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="road" value="{{ overview.road }}">
+    <input type="hidden" name="date" value="{{ overview.date }}">
+    <label>
+      巡检明细 CSV
+      <input type="file" name="file" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">上传</button>
+  </form>
+  <p class="hint">
+    表头需包含「记录号、整米里程、病害等级」（也接受英文列名）。同日同号且内容相同只收一次；
+    内容不同则整份文件拒绝并报冲突。记录按整米里程自动归入对应分区。
+  </p>
+
+  <h3>下载 CSV</h3>
+  <form method="get" action="{{ url_for('download') }}" class="grid-form">
+    <input type="hidden" name="road" value="{{ overview.road }}">
+    <input type="hidden" name="date" value="{{ overview.date }}">
+    <label>
+      起始里程（含）
+      <input type="number" name="start" min="0" step="1" value="0" required>
+    </label>
+    <label>
+      结束里程（含，留空到无穷）
+      <input type="number" name="end" min="0" step="1" placeholder="留空表示不限">
+    </label>
+    <button type="submit">下载</button>
+  </form>
+  <p class="hint">只读取与所选里程范围相交的有效分区；下载过程中若发生拆分切换，按开始时的分区布局读完。</p>
+</section>
+{% elif not error %}
+<section class="panel">
+  <p class="hint">输入公路名称和日期后查看或上传当天记录。</p>
+</section>
+{% endif %}
+{% endblock %}
