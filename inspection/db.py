@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS split_jobs (
     status TEXT NOT NULL CHECK (status IN ('copying', 'switched', 'failed')),
     error TEXT,
     copied_records INTEGER NOT NULL DEFAULT 0,
+    -- Fixed at split start: highest records.id of the source partition that
+    -- belongs to the split snapshot.  The bounded copy only reads rows with
+    -- id <= copy_upto_id, so continuously arriving supplements cannot make
+    -- the copy chase an ever-moving tail.  Late rows are staged separately
+    -- before the switch transaction.
+    copy_upto_id INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     finished_at TEXT
 );
@@ -274,6 +280,25 @@ def recover_interrupted_splits(db_path: str) -> None:
         _recover_interrupted_splits(conn)
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first release to pre-existing DBs.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not alter an old ``split_jobs`` table,
+    so the split high-water-mark column is added explicitly when missing.
+    """
+
+    job_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(split_jobs)")
+    }
+    if "copy_upto_id" not in job_columns:
+        # A constant DEFAULT lets SQLite add the NOT NULL column without a
+        # table rebuild; existing jobs simply read as bound 0.
+        conn.execute(
+            "ALTER TABLE split_jobs "
+            "ADD COLUMN copy_upto_id INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def init_db(db_path: str) -> None:
     directory = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(directory, exist_ok=True)
@@ -284,6 +309,7 @@ def init_db(db_path: str) -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
+        _migrate_schema(conn)
         # Only recover when no live process is mid-copy.  While it holds the
         # split lock, its in-progress job is not "interrupted".
         try:

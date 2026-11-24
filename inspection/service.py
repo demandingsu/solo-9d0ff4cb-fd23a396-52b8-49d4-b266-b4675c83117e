@@ -6,10 +6,16 @@ Consistency model
 * A split creates two shadow partitions and stages a copy of the source rows.
   The source stays active and readable for the whole copy phase, so uploads
   keep working and a download keeps seeing a complete day.
-* The switch is a single ``BEGIN IMMEDIATE`` transaction: any rows that
-  arrived during the copy are folded in, the source rows are removed and the
-  same rows are inserted into the two children, then statuses are flipped.
-  Readers therefore see either the source or the two children, never a mix.
+* The copy is bounded by a high-water mark fixed when the split starts: it
+  only stages rows that already existed then.  Supplements committed during
+  the copy do not extend that bound, so sustained reporting cannot make the
+  copy chase an ever-growing tail.
+* Before the switch transaction, every supplement committed so far is staged
+  ("prepared for the archive").  The switch is a single
+  ``BEGIN IMMEDIATE`` transaction: it sweeps the tiny residual delta, checks
+  counts, removes the source rows and inserts the same rows into the two
+  children, then flips statuses.  Readers therefore see either the source or
+  the two children, never a mix, and every record is moved exactly once.
 * If anything fails before the switch, cleanup (or startup recovery) drops
   the shadows/staging and leaves the unchanged source partition in place.
 """
@@ -291,6 +297,14 @@ def begin_split(conn: sqlite3.Connection, road: str, date: str, cut: int) -> dic
 
     with write_transaction(conn):
         source = _split_source(conn, road, date, cut)
+        # Fixed inside this write transaction (BEGIN IMMEDIATE): no upload can
+        # commit concurrently, so this is exactly the set of details existing
+        # at split start.  Later supplements receive larger record ids and are
+        # deliberately outside the bounded copy.
+        upto_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM records WHERE partition_id = ?",
+            (source["id"],),
+        ).fetchone()[0]
         left_id = conn.execute(
             "INSERT INTO partitions (road, date, lo, hi, status, parent_id) "
             "VALUES (?, ?, ?, ?, 'shadow', ?)",
@@ -304,8 +318,9 @@ def begin_split(conn: sqlite3.Connection, road: str, date: str, cut: int) -> dic
         job_id = conn.execute(
             "INSERT INTO split_jobs "
             "(source_partition_id, cut, left_partition_id, right_partition_id, "
-            "status) VALUES (?, ?, ?, ?, 'copying')",
-            (source["id"], cut, left_id, right_id),
+            "status, copy_upto_id) "
+            "VALUES (?, ?, ?, ?, 'copying', ?)",
+            (source["id"], cut, left_id, right_id, upto_id),
         ).lastrowid
         updated = conn.execute(
             "UPDATE partitions SET split_state = 'copying' "
@@ -315,12 +330,13 @@ def begin_split(conn: sqlite3.Connection, road: str, date: str, cut: int) -> dic
         if updated != 1:
             raise SplitError("该分区已有拆分任务在进行")
         logger.info(
-            "split started job=%s road=%s date=%s source=%s cut=%s",
+            "split started job=%s road=%s date=%s source=%s cut=%s upto_id=%s",
             job_id,
             road,
             date,
             source["id"],
             cut,
+            upto_id,
         )
         return {
             "job_id": job_id,
@@ -330,6 +346,7 @@ def begin_split(conn: sqlite3.Connection, road: str, date: str, cut: int) -> dic
             "lo": source["lo"],
             "hi": source["hi"],
             "cut": cut,
+            "copy_upto_id": upto_id,
         }
 
 
@@ -344,21 +361,38 @@ def _copy_records(
     job: dict,
     batch_size: int,
     on_batch: Callable[[int, int], None] | None,
-) -> None:
-    """Stage a copy in short transactions, leaving the source writable.
+) -> int:
+    """Stage the split-start snapshot in short transactions.
 
-    Rows inserted by concurrent uploads receive larger row ids and are picked
-    up by a later batch, or by the final delta copy inside the switch.
+    Only rows with ``id <= copy_upto_id`` (the high-water mark fixed in
+    :func:`begin_split`) are read.  Rows inserted by concurrent supplements
+    have larger ids and are deliberately not followed here, so the number of
+    batches is fixed when the split starts and a continuously uploading
+    client cannot make this loop chase the tail forever.  Late rows are
+    staged by :func:`_stage_late_reports` before the switch instead.
+
+    Returns the number of snapshot rows staged.
     """
+
+    upto_id = job.get("copy_upto_id")
+    if upto_id is None:
+        # Defensive fallback for job mappings not produced by begin_split:
+        # bind to the current maximum once rather than scanning an open tail.
+        with connect(db_path) as probe:
+            upto_id = probe.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM records WHERE partition_id = ?",
+                (job["source_id"],),
+            ).fetchone()[0]
 
     last_id = 0
     copied = 0
-    while True:
+    while last_id < upto_id:
         with connect(db_path) as reader:
             rows = reader.execute(
                 "SELECT id, record_no, mileage, grade FROM records "
-                "WHERE partition_id = ? AND id > ? ORDER BY id LIMIT ?",
-                (job["source_id"], last_id, batch_size),
+                "WHERE partition_id = ? AND id > ? AND id <= ? "
+                "ORDER BY id LIMIT ?",
+                (job["source_id"], last_id, upto_id, batch_size),
             ).fetchall()
         if not rows:
             break
@@ -395,6 +429,49 @@ def _copy_records(
         last_id = rows[-1]["id"]
         if on_batch is not None:
             on_batch(job["job_id"], copied)
+
+    return copied
+
+
+def _stage_late_reports(db_path: str, job_id: int) -> int:
+    """Stage supplements that arrived after the snapshot copy.
+
+    This is the "prepare everything needed for the move before entering the
+    switch transaction" step: one short write transaction stages every source
+    row missing from ``split_staging`` (idempotent via ``INSERT OR IGNORE``)
+    and refreshes the progress count.  Reports that commit in the tiny window
+    between this commit and the switch transaction are swept by the switch's
+    own idempotent catch-up, so nothing is lost.
+
+    Returns the total number of rows now staged for the job.
+    """
+
+    with connect(db_path) as conn:
+        with write_transaction(conn):
+            job = _job_row(conn, job_id)
+            if job is None or job["status"] != "copying":
+                raise SplitError("拆分任务已不可用")
+            conn.execute(
+                "INSERT OR IGNORE INTO split_staging "
+                "(job_id, record_id, record_no, mileage, grade) "
+                "SELECT ?, id, record_no, mileage, grade FROM records "
+                "WHERE partition_id = ?",
+                (job_id, job["source_partition_id"]),
+            )
+            staged = conn.execute(
+                "SELECT COUNT(*) FROM split_staging WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE split_jobs SET copied_records = ? WHERE id = ?",
+                (staged, job_id),
+            )
+            logger.info(
+                "late reports prepared before switch job=%s staged=%s",
+                job_id,
+                staged,
+            )
+            return staged
 
 
 def _switch_split(db_path: str, job_id: int) -> int:
@@ -433,9 +510,11 @@ def _switch_split(db_path: str, job_id: int) -> int:
             if left["hi"] != job["cut"] or right["lo"] != job["cut"]:
                 raise SplitError("影子分区边界与切点不一致")
 
-            # Fold in rows uploaded after the last staged batch.  The write
-            # transaction prevents uploads from committing between this delta
-            # copy, the source delete, and the child insert.
+            # Final residual sweep: _stage_late_reports already prepared the
+            # supplements before this transaction; only rows committed in the
+            # gap since then can be missing.  The write transaction prevents
+            # uploads from committing between this sweep, the source delete,
+            # and the child insert.
             conn.execute(
                 "INSERT OR IGNORE INTO split_staging "
                 "(job_id, record_id, record_no, mileage, grade) "
@@ -577,11 +656,19 @@ def split_day(
     *,
     batch_size: int = 500,
     on_batch: Callable[[int, int], None] | None = None,
+    on_before_switch: Callable[[int, int], None] | None = None,
 ) -> int:
     """Split a day leaf at ``cut``.  Mileage equal to the cut goes right.
 
-    ``on_batch`` is an observability/test hook invoked after each copy batch
-    has committed, while no write lock is held.
+    ``on_batch`` is an observability/test hook invoked after each snapshot
+    copy batch has committed, while no write lock is held; its second argument
+    is the number of rows staged so far (never above the split-start count
+    while snapshot batches are running).
+
+    ``on_before_switch`` is invoked as ``(job_id, staged_count)`` after the
+    bounded copy and the pre-switch supplement preparation are complete, but
+    immediately before the atomic switch transaction begins.  Raising there
+    aborts the split before the switch and leaves the source partition intact.
     """
 
     if batch_size < 1:
@@ -605,6 +692,9 @@ def split_day(
 
             try:
                 _copy_records(db_path, job, batch_size, on_batch)
+                staged = _stage_late_reports(db_path, job["job_id"])
+                if on_before_switch is not None:
+                    on_before_switch(job["job_id"], staged)
                 return _switch_split(db_path, job["job_id"])
             except BaseException as exc:
                 fail_split(db_path, job["job_id"], str(exc))
